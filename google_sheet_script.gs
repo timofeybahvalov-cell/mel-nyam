@@ -5,10 +5,12 @@
  * (меню «Расширения» → «Apps Script»), и публикуется как веб-приложение
  * («Начать развёртывание» → «Новое развёртывание» → тип «Веб-приложение»,
  *  «Запуск от имени: Я», «У кого есть доступ: Все»).
- * Листы «records», «levels» и «users» скрипт создаёт сам при первом обращении.
- * Как всё это сделать по шагам (и как перейти с версии 0.3 на 0.4) — в файле ONLINE_SETUP.md.
+ * Листы «records», «levels», «users», «saves» и «support» скрипт создаёт сам при первом обращении.
+ * Как всё это сделать по шагам (и как перейти на новую версию) — в файле ONLINE_SETUP.md.
  *
  * С версии 0.4 здесь же: аккаунты игроков (ник + пароль), список «кто в сети» и команды админки.
+ * С версии 0.5: прогресс игрока хранится в его аккаунте (лист «saves»), переписка с поддержкой
+ * (лист «support») и значки игроков (столбец «badge» на листе «users»).
  *   • Пароли игроков в таблицу не попадают: игра присылает только их SHA-256, а на листе «users»
  *     хранится хеш от этого хеша с «солью». Узнать пароль по таблице нельзя.
  *   • Админка (MelNyamAdmin.exe) работает только с паролем админки. Его создаёт функция
@@ -21,7 +23,12 @@
  *   • чтобы заблокировать игрока, впиши любой символ в столбец «banned» на листе «users».
  */
 var SALT = 'mel-nyam/v2/4eKywka';   // тот же, что в игре (src/g_online.inc)
-var PROTO = 4;                      // что умеет этот скрипт: 2 — рекорды и уровни (V0.2, V0.3), 4 — ещё и аккаунты (V0.4)
+var PROTO = 5;                      // что умеет этот скрипт: 2 — рекорды и уровни (V0.2, V0.3), 4 — ещё и аккаунты (V0.4), 5 — сохранения, поддержка, значки (V0.5)
+var SAVE_MAX = 6000;                // самое длинное сохранение игрока, символов
+var MSG_LEN = 300;                  // самое длинное сообщение в поддержку, символов
+var MSG_PER_MIN = 4;                // сообщений в поддержку от одного игрока за минуту
+var MSG_PER_6H = 40;                // ...и за шесть часов
+var BADGES = 3;                     // значки: 1 — создатель игры, 2 — модератор, 3 — друг игры
 var MAX_TOKENS = 5;                 // на скольких устройствах можно быть в аккаунте одновременно
 var REGS_PER_DAY = 300;             // сколько аккаунтов можно создать за сутки (защита от ботов)
 var ONLINE_SEC = 150;               // игрок считается «в сети», если его игра откликалась не раньше, чем столько секунд назад
@@ -56,6 +63,9 @@ function handleGet_(p) {
   if (a === 'lvl') return lvl_(parseInt(p.id, 10) || 0);
   if (a === 'hb') return hb_(p);
   if (a === 'mine') return mine_(String(p.u || ''), String(p.t || ''));
+  if (a === 'load') return load_(String(p.u || ''), String(p.t || ''));
+  if (a === 'mylv') return mylv_(String(p.u || ''), String(p.t || ''));
+  if (a === 'chat') return chat_(String(p.u || ''), String(p.k || ''), parseInt(p.after, 10) || 0, String(p.peek || '') === '1');
   if (a === 'time') return 'ok\t' + Math.floor(Date.now() / 1000);
   if (a === 'ping' || a === '') return 'ok\tmel-nyam\t' + PROTO;
   return 'err\tunknown';
@@ -72,6 +82,8 @@ function handlePost_(body) {
   if (f[0] === 'ren') return ren_(f);
   if (f[0] === 'pw') return pw_(f);
   if (f[0] === 'out') return out_(f);
+  if (f[0] === 'save') return save_(f);
+  if (f[0] === 'msg') return msg_(f);
   if (f[0] === 'adm') return adm_(f);
   return 'err\tunknown';
 }
@@ -91,7 +103,16 @@ function sheet_(name, header, textCols) {
 function recSheet_() { return sheet_('records', ['level', 'uid', 'nick', 'stars', 'ticks', 'replay', 'date'], ['A:C', 'F:F']); }
 function lvlSheet_() { return sheet_('levels', ['id', 'uid', 'author', 'name', 'stars', 'bg', 'plays', 'date', 'hidden', 'data', 'replay'], ['B:D', 'I:K']); }
 function userSheet_() {
-  return sheet_('users', ['uid', 'nick', 'key', 'salt', 'hash', 'tokens', 'created', 'seen', 'where', 'ver', 'platform', 'banned', 'note'], ['A:F', 'I:I', 'L:M']);
+  return sheet_('users', ['uid', 'nick', 'key', 'salt', 'hash', 'tokens', 'created', 'seen', 'where', 'ver', 'platform', 'banned', 'note', 'badge'], ['A:F', 'I:I', 'L:M']);
+}
+function saveSheet_() { return sheet_('saves', ['uid', 'rev', 'date', 'data'], ['A:A', 'D:D']); }
+function supSheet_() { return sheet_('support', ['id', 'uid', 'nick', 'who', 'text', 'date', 'seen', 'key'], ['B:E', 'G:H']); }
+function findRow_(sh, col, key) {    // номер первой строки, где в этом столбце стоит key, или 0
+  var n = sh.getLastRow() - 1;
+  if (n < 1) return 0;
+  var v = sh.getRange(2, col, n, 1).getValues();
+  for (var i = 0; i < n; i++) if (String(v[i][0]) === key) return i + 2;
+  return 0;
 }
 function rows_(sh, cols) {
   var n = sh.getLastRow() - 1;
@@ -180,7 +201,7 @@ function top_(level) {
   var U = usersSafe_(), all = levelRecs_(rows_(recSheet_(), 5), level), r = [], i;
   for (i = 0; i < all.length && r.length < TOP_N; i++) if (!isBanned_(U, all[i].uid)) r.push(all[i]);       // заблокированных в таблице не видно
   var n = r.length, out = ['ok\t' + n];
-  for (i = 0; i < n; i++) out.push((i + 1) + '\t' + showNick_(U, r[i].uid, r[i].nick) + '\t' + r[i].stars + '\t' + r[i].ticks + '\t' + pid_(r[i].uid, level));
+  for (i = 0; i < n; i++) out.push((i + 1) + '\t' + showNick_(U, r[i].uid, r[i].nick) + '\t' + r[i].stars + '\t' + r[i].ticks + '\t' + pid_(r[i].uid, level) + '\t' + badge_(U, r[i].uid));
   var text = out.join('\n');
   cache.put(key, text, 60);
   return text;
@@ -245,12 +266,12 @@ function list_(sort, off) {
   var all = rows_(lvlSheet_(), 9), r = [], U = usersSafe_();
   for (var i = 0; i < all.length; i++) {
     if (String(all[i][8]) !== '' || isBanned_(U, String(all[i][1]))) continue;         // скрыт владельцем таблицы или автор заблокирован
-    r.push({ id: Number(all[i][0]), author: showNick_(U, String(all[i][1]), all[i][2]), name: String(all[i][3]), stars: Number(all[i][4]) || 0, bg: Number(all[i][5]) || 0, plays: Number(all[i][6]) || 0 });
+    r.push({ id: Number(all[i][0]), author: showNick_(U, String(all[i][1]), all[i][2]), name: String(all[i][3]), stars: Number(all[i][4]) || 0, bg: Number(all[i][5]) || 0, plays: Number(all[i][6]) || 0, badge: badge_(U, String(all[i][1])) });
   }
   if (sort === 'top') r.sort(function (a, b) { return b.plays - a.plays || b.id - a.id; });
   else r.sort(function (a, b) { return b.id - a.id; });
   var out = ['ok\t' + r.length];
-  for (var k = off; k < r.length && k < off + PAGE; k++) out.push(r[k].id + '\t' + r[k].name + '\t' + r[k].author + '\t' + r[k].stars + '\t' + r[k].plays + '\t' + r[k].bg);
+  for (var k = off; k < r.length && k < off + PAGE; k++) out.push(r[k].id + '\t' + r[k].name + '\t' + r[k].author + '\t' + r[k].stars + '\t' + r[k].plays + '\t' + r[k].bg + '\t' + r[k].badge);
   var text = out.join('\n');
   cache.put(key, text, 30);
   return text;
@@ -262,7 +283,7 @@ function lvl_(id) {
   var v = sh.getRange(row, 1, 1, 11).getValues()[0], U = usersSafe_();
   if (String(v[8]) !== '' || isBanned_(U, String(v[1]))) return 'err\tnot found';
   sh.getRange(row, 7).setValue((Number(v[6]) || 0) + 1);                              // счётчик «сыграно»
-  return 'ok\t' + id + '\t' + String(v[3]) + '\t' + showNick_(U, String(v[1]), v[2]) + '\t' + String(v[9]) + '\t' + String(v[10]);
+  return 'ok\t' + id + '\t' + String(v[3]) + '\t' + showNick_(U, String(v[1]), v[2]) + '\t' + String(v[9]) + '\t' + String(v[10]) + '\t' + badge_(U, String(v[1]));
 }
 function pub_(f, v4) {               // pub, uid, ник, название, уровень, запись прохождения, подпись   |   pub2: вместо ника — ключ аккаунта
   if (f.length < 7) return 'err\tformat';
@@ -325,11 +346,11 @@ function kList_(sort, off) { return 'list:' + gen_() + ':' + sort + ':' + off; }
 
 /* ---------------------------------------------------------------- V0.4: игроки */
 function users_(sh) {
-  var v = rows_(sh, 13), U = { byUid: {}, byKey: {}, list: [] };
+  var v = rows_(sh, 14), U = { byUid: {}, byKey: {}, list: [] };
   for (var i = 0; i < v.length; i++) {
     var u = { row: i + 2, uid: String(v[i][0]), nick: String(v[i][1]), key: String(v[i][2]), salt: String(v[i][3]), hash: String(v[i][4]),
               tokens: String(v[i][5]) ? String(v[i][5]).split(',') : [], created: v[i][6], seen: v[i][7], where: String(v[i][8]),
-              ver: Number(v[i][9]) || 0, pf: Number(v[i][10]) || 0, banned: String(v[i][11]) !== '', note: String(v[i][12]) };
+              ver: Number(v[i][9]) || 0, pf: Number(v[i][10]) || 0, banned: String(v[i][11]) !== '', note: String(v[i][12]), badge: Number(v[i][13]) || 0 };
     if (!u.uid) continue;
     U.byUid[u.uid] = u; U.list.push(u);
     if (u.hash && u.key) U.byKey[u.key] = u;
@@ -340,6 +361,7 @@ function usersSafe_() {              // для старых команд: есл
   try { return users_(userSheet_()); } catch (e) { return { byUid: {}, byKey: {}, list: [] }; }
 }
 function isBanned_(U, uid) { var u = U.byUid[String(uid)]; return !!(u && u.banned); }
+function badge_(U, uid) { var u = U.byUid[String(uid)]; return u && u.hash && u.badge > 0 && u.badge <= BADGES ? u.badge : 0; }      // значок есть только у аккаунта
 function legacyNick_(U, nick) {      // ник игрока без аккаунта: чужой ник с паролем занять нельзя
   var n = cleanNick_(nick);
   return U.byKey[nickKey_(n)] ? 'Игрок' : n;
@@ -472,7 +494,107 @@ function hb_(p) {                    // a=hb, u — номер игрока, t �
       if (String(sh.getRange(u.row, 1).getValue()) === uid) sh.getRange(u.row, 8, 1, 4).setValues([[new Date(), w, v, pf]]);
     } catch (e) {}
   }
-  return 'ok\t' + now;
+  return 'ok\t' + now + '\t' + (parseInt(cache.get('su:' + uid), 10) || 0) + '\t' + (nick ? badge_(U, uid) : 0);      // время, непрочитанные ответы поддержки, значок
+}
+
+/* ---------------------------------------------------------------- V0.5: прогресс в аккаунте */
+/* Игра хранит прогресс (пройденные уровни, чекушки, скины, достижения, задания) одной строкой и кладёт её сюда.
+   Скрипт строку не разбирает. У каждого сохранения есть номер: если с другого устройства успели сохранить раньше,
+   игра получает «conflict» вместе с тем, что лежит в таблице, складывает оба сохранения и присылает снова. */
+function load_(uid, token) {
+  var U = usersSafe_();
+  if (!auth_(U, uid, token)) return isBanned_(U, uid) ? 'err\tban' : 'err\tauth';
+  var sh = saveSheet_(), row = findRow_(sh, 1, uid);
+  if (!row) return 'ok\t0\t';
+  var v = sh.getRange(row, 1, 1, 4).getValues()[0];
+  return 'ok\t' + (Number(v[1]) || 0) + '\t' + String(v[3]);
+}
+function save_(f) {                  // save, uid, ключ, номер сохранения, которое игра видела, данные, подпись
+  if (f.length < 6) return 'err\tformat';
+  var uid = f[1], base = parseInt(f[3], 10) || 0, data = f[4];
+  if (!/^\d{1,10}$/.test(uid) || data.length > SAVE_MAX || !/^v5\|[0-9a-z.,:|\-]*$/.test(data)) return 'err\tformat';
+  if (sig_(['save', uid, f[3], data, '']) !== f[5]) return 'err\tsig';
+  var lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    var U = users_(userSheet_());
+    if (!auth_(U, uid, f[2])) return isBanned_(U, uid) ? 'err\tban' : 'err\tauth';
+    var sh = saveSheet_(), row = findRow_(sh, 1, uid), now = new Date();
+    if (!row) { sh.appendRow([uid, 1, now, data]); return 'ok\t1'; }
+    var v = sh.getRange(row, 1, 1, 4).getValues()[0], rev = Number(v[1]) || 0;
+    if (rev !== base) return 'err\tconflict\t' + rev + '\t' + String(v[3]);
+    sh.getRange(row, 2, 1, 3).setValues([[rev + 1, now, data]]);
+    return 'ok\t' + (rev + 1);
+  } finally { lock.releaseLock(); }
+}
+function mylv_(uid, token) {         // уровни, которые опубликовал этот игрок: номер, сколько раз сыграли, когда опубликован, скрыт ли
+  var U = usersSafe_();
+  if (!auth_(U, uid, token)) return isBanned_(U, uid) ? 'err\tban' : 'err\tauth';
+  var all = rows_(lvlSheet_(), 9), out = [];
+  for (var i = 0; i < all.length; i++) if (String(all[i][1]) === uid) out.push([Number(all[i][0]), Number(all[i][6]) || 0, ts_(all[i][7]), String(all[i][8]) !== '' ? 1 : 0].join('\t'));
+  return 'ok\t' + out.length + (out.length ? '\n' + out.join('\n') : '');
+}
+
+/* ---------------------------------------------------------------- V0.5: поддержка */
+/* Переписка игрока с разработчиком. У каждого игрока одна переписка (по его номеру). Игрок с аккаунтом подтверждает себя
+   ключом устройства, игрок без аккаунта — случайным ключом, который его игра придумала при первом сообщении.
+   Текст хранится с приставкой «t:», чтобы таблица никогда не приняла его за формулу или число. */
+function cleanMsg_(s) {
+  s = String(s || '').replace(/[\u0000-\u001f\u007f\u2028\u2029]/g, ' ').replace(/\s+/g, ' ').replace(/^ | $/g, '');
+  return s.length > MSG_LEN ? s.substr(0, MSG_LEN) : s;
+}
+function supWho_(U, uid, key, rows) { // кто пишет: 'acc' — аккаунт, 'guest' — игрок без аккаунта, '' — чужой, 'ban' — заблокирован
+  var u = U.byUid[uid];
+  if (u && u.banned) return 'ban';
+  if (u && u.hash) return auth_(U, uid, key) ? 'acc' : '';
+  if (!/^[0-9a-f]{32}$/.test(key)) return '';
+  var kh = sha_('g:' + key).substr(0, 32);
+  for (var i = 0; i < rows.length; i++) if (String(rows[i][1]) === uid && String(rows[i][7]) !== '') return String(rows[i][7]) === kh ? 'guest' : '';
+  return 'guest';
+}
+function msg_(f) {                   // msg, uid, ключ, текст, версия игры, подпись
+  if (f.length < 6) return 'err\tformat';
+  var uid = f[1], text = cleanMsg_(f[3]);
+  if (!/^[1-9]\d{0,9}$/.test(uid) || !text) return 'err\tformat';
+  if (sig_(['msg', uid, f[3], '', '']) !== f[5]) return 'err\tsig';
+  var cache = CacheService.getScriptCache(), k1 = 'm1:' + uid + ':' + Math.floor(Date.now() / 60000), k6 = 'm6:' + uid;
+  var n1 = parseInt(cache.get(k1), 10) || 0, n6 = parseInt(cache.get(k6), 10) || 0;
+  if (n1 >= MSG_PER_MIN || n6 >= MSG_PER_6H) return 'err\tslow';
+  var lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    var U = usersSafe_(), sh = supSheet_(), rows = rows_(sh, 8), who = supWho_(U, uid, f[2], rows);
+    if (who === 'ban') return 'err\tban';
+    if (!who) return 'err\tauth';
+    if (rows.length >= 20000) return 'err\tfull';
+    var id = 0, first = true, i;
+    for (i = 0; i < rows.length; i++) { id = Math.max(id, Number(rows[i][0]) || 0); if (String(rows[i][1]) === uid) first = false; }
+    var u = U.byUid[uid];
+    sh.appendRow([id + 1, uid, u && u.hash ? u.nick : '', 'p', 't:' + text, new Date(), '', who === 'guest' && first ? sha_('g:' + f[2]).substr(0, 32) : '']);
+    cache.put(k1, String(n1 + 1), 120); cache.put(k6, String(n6 + 1), 21600);
+    return 'ok\t' + (id + 1);
+  } finally { lock.releaseLock(); }
+}
+function chat_(uid, key, after, peek) {    // сообщения переписки с номером больше after: номер, кто (p — игрок, a — разработчик), время, текст
+  // peek: игра только проверяет при запуске, нет ли ответа; прочитанным он станет, когда игрок откроет переписку
+  if (!/^[1-9]\d{0,9}$/.test(uid)) return 'err\tformat';
+  var U = usersSafe_(), sh = supSheet_(), rows = rows_(sh, 8), who = supWho_(U, uid, key, rows), out = [], seen = [], i;
+  if (who === 'ban') return 'err\tban';
+  if (!who) return 'err\tauth';
+  for (i = 0; i < rows.length; i++) {
+    if (String(rows[i][1]) !== uid) continue;
+    var id = Number(rows[i][0]) || 0, w = String(rows[i][3]);
+    if (w === 'a' && String(rows[i][6]) === '') seen.push(i + 2);
+    if (id > after) out.push([id, w === 'a' ? 'a' : 'p', ts_(rows[i][5]), String(rows[i][4]).replace(/^t:/, '')].join('\t'));
+  }
+  if (out.length > 80) out = out.slice(-80);
+  if (seen.length && !peek) {        // ответы разработчика прочитаны
+    var lock = LockService.getScriptLock();
+    lock.waitLock(20000);
+    try { for (i = 0; i < seen.length; i++) if (String(sh.getRange(seen[i], 2).getValue()) === uid) sh.getRange(seen[i], 7).setValue('x'); } finally { lock.releaseLock(); }
+  }
+  if (!peek) CacheService.getScriptCache().remove('su:' + uid);
+  return 'ok\t' + out.length + (out.length ? '\n' + out.join('\n') : '');
 }
 function onlineNow_() {
   var cache = CacheService.getScriptCache(), idx = cache.get('online') || '', list = idx ? idx.split(',') : [], out = [], keep = [], now = Math.floor(Date.now() / 1000);
@@ -523,7 +645,48 @@ function admRun_(cmd, a1, a2, props) {
   if (cmd === 'hello') {
     var fails = parseInt(props.getProperty('ADMIN_FAILS'), 10) || 0;
     props.setProperty('ADMIN_FAILS', '0');
-    return 'ok\t' + PROTO + '\t' + fails + '\t' + U.list.length + '\t' + Math.max(0, recSheet_().getLastRow() - 1) + '\t' + Math.max(0, lvlSheet_().getLastRow() - 1) + '\t' + onlineNow_().length;
+    var sup = rows_(supSheet_(), 7), unread = 0;
+    for (i = 0; i < sup.length; i++) if (String(sup[i][3]) === 'p' && String(sup[i][6]) === '') unread++;
+    return 'ok\t' + PROTO + '\t' + fails + '\t' + U.list.length + '\t' + Math.max(0, recSheet_().getLastRow() - 1) + '\t' + Math.max(0, lvlSheet_().getLastRow() - 1) + '\t' + onlineNow_().length + '\t' + unread;
+  }
+  if (cmd === 'threads') {           // переписки поддержки: у кого, сколько непрочитанных, последнее сообщение
+    var sr = rows_(supSheet_(), 7), th = {}, ord = [], t;
+    for (i = 0; i < sr.length; i++) {
+      var su = String(sr[i][1]);
+      if (!th[su]) { th[su] = { uid: su, nick: '', unread: 0, total: 0, ts: 0, who: '', text: '', last: 0 }; ord.push(su); }
+      t = th[su]; t.total++;
+      if (String(sr[i][3]) === 'p') { if (String(sr[i][6]) === '') t.unread++; if (String(sr[i][2])) t.nick = String(sr[i][2]); }
+      if ((Number(sr[i][0]) || 0) >= t.last) { t.last = Number(sr[i][0]) || 0; t.ts = ts_(sr[i][5]); t.who = String(sr[i][3]); t.text = String(sr[i][4]).replace(/^t:/, '').substr(0, 80); }
+    }
+    ord.sort(function (a, b) { return th[b].last - th[a].last; });
+    out = ['ok\t' + ord.length];
+    for (i = 0; i < ord.length; i++) { t = th[ord[i]]; var tu = U.byUid[t.uid]; out.push([t.uid, tu && tu.hash ? tu.nick : t.nick, t.unread, t.total, t.ts, t.who, t.text, tu && tu.hash ? 1 : 0].join('\t')); }
+    return out.join('\n');
+  }
+  if (cmd === 'thread' || cmd === 'reply' || cmd === 'delthread') {
+    if (!/^[1-9]\d{0,9}$/.test(a1)) return 'err\tformat';
+    var ss = supSheet_(), sv = rows_(ss, 7), maxId = 0;
+    if (cmd === 'reply') {
+      var txt = cleanMsg_(a2);
+      if (!txt) return 'err\tformat';
+      for (i = 0; i < sv.length; i++) maxId = Math.max(maxId, Number(sv[i][0]) || 0);
+      ss.appendRow([maxId + 1, a1, u && u.hash ? u.nick : '', 'a', 't:' + txt, new Date(), '', '']);
+      var cc = CacheService.getScriptCache(); cc.put('su:' + a1, String((parseInt(cc.get('su:' + a1), 10) || 0) + 1), 21600);
+      return 'ok\t' + (maxId + 1);
+    }
+    if (cmd === 'delthread') {
+      var cnt = 0;
+      for (i = sv.length - 1; i >= 0; i--) if (String(sv[i][1]) === a1) { ss.deleteRow(i + 2); cnt++; }
+      return 'ok\t' + cnt;
+    }
+    out = [];
+    for (i = 0; i < sv.length; i++) {
+      if (String(sv[i][1]) !== a1) continue;
+      if (String(sv[i][3]) === 'p' && String(sv[i][6]) === '') ss.getRange(i + 2, 7).setValue('x');       // прочитано разработчиком
+      out.push([Number(sv[i][0]) || 0, String(sv[i][3]) === 'a' ? 'a' : 'p', ts_(sv[i][5]), String(sv[i][4]).replace(/^t:/, ''), String(sv[i][6]) !== '' ? 1 : 0].join('\t'));
+    }
+    if (out.length > 200) out = out.slice(-200);
+    return 'ok\t' + out.length + (out.length ? '\n' + out.join('\n') : '');
   }
   if (cmd === 'online') {
     var on = onlineNow_(); out = ['ok\t' + on.length];
@@ -536,16 +699,16 @@ function admRun_(cmd, a1, a2, props) {
   if (cmd === 'users') {             // все, кого знает таблица: и с аккаунтом, и без (по рекордам и уровням)
     var rs = recSheet_(), recs = rows_(rs, 3), lv = rows_(lvlSheet_(), 8), m = {}, order = [], e;
     var rd = recs.length ? rs.getRange(2, 7, recs.length, 1).getValues() : [];             // когда поставлен каждый рекорд
-    var get = function (uid) { if (!m[uid]) { m[uid] = { uid: uid, nick: '', reg: 0, ban: 0, created: 0, seen: 0, where: '', ver: 0, pf: 0, recs: 0, lvls: 0, note: '' }; order.push(uid); } return m[uid]; };
+    var get = function (uid) { if (!m[uid]) { m[uid] = { uid: uid, nick: '', reg: 0, ban: 0, created: 0, seen: 0, where: '', ver: 0, pf: 0, recs: 0, lvls: 0, note: '', badge: 0 }; order.push(uid); } return m[uid]; };
     for (i = 0; i < U.list.length; i++) {
       var x = U.list[i]; e = get(x.uid);
-      e.nick = x.nick; e.reg = x.hash ? 1 : 0; e.ban = x.banned ? 1 : 0; e.created = ts_(x.created); e.seen = ts_(x.seen); e.where = x.where; e.ver = x.ver; e.pf = x.pf; e.note = x.note;
+      e.nick = x.nick; e.reg = x.hash ? 1 : 0; e.ban = x.banned ? 1 : 0; e.created = ts_(x.created); e.seen = ts_(x.seen); e.where = x.where; e.ver = x.ver; e.pf = x.pf; e.note = x.note; e.badge = badge_(U, x.uid);
     }
     // «был в игре»: последний отклик игры, а у тех, кто играл до V0.4, — день последнего рекорда или уровня
     for (i = 0; i < recs.length; i++) { e = get(String(recs[i][1])); e.recs++; if (!e.nick) e.nick = String(recs[i][2]); e.seen = Math.max(e.seen, ts_(rd[i][0])); }
     for (i = 0; i < lv.length; i++) { e = get(String(lv[i][1])); e.lvls++; if (!e.nick) e.nick = String(lv[i][2]); e.seen = Math.max(e.seen, ts_(lv[i][7])); }
     out = ['ok\t' + order.length];
-    for (i = 0; i < order.length; i++) { e = m[order[i]]; out.push([e.uid, e.nick, e.reg, e.ban, e.created, e.seen, e.where, e.ver, e.pf, e.recs, e.lvls, String(e.note).replace(/[\t\n\r]/g, ' ')].join('\t')); }
+    for (i = 0; i < order.length; i++) { e = m[order[i]]; out.push([e.uid, e.nick, e.reg, e.ban, e.created, e.seen, e.where, e.ver, e.pf, e.recs, e.lvls, String(e.note).replace(/[\t\n\r]/g, ' '), e.badge].join('\t')); }
     return out.join('\n');
   }
   if (cmd === 'levels') {
@@ -569,8 +732,18 @@ function admRun_(cmd, a1, a2, props) {
     bump_();
     return 'ok';
   }
-  if (cmd === 'del') {               // удалить игрока совсем: аккаунт, рекорды, уровни
+  if (cmd === 'badge') {             // значок рядом с ником (a2: 0 — убрать, 1 — создатель игры, 2 — модератор, 3 — друг игры)
+    if (!u || !u.hash) return 'err\tnot found';
+    var b = parseInt(a2, 10) || 0;
+    if (b < 0 || b > BADGES) return 'err\tformat';
+    if (String(sh.getRange(1, 14).getValue()) === '') sh.getRange(1, 14).setValue('badge');      // таблица, созданная версией 0.4: у неё ещё нет такого столбца
+    sh.getRange(u.row, 14).setValue(b ? b : '');
+    bump_();
+    return 'ok';
+  }
+  if (cmd === 'del') {               // удалить игрока совсем: аккаунт, рекорды, уровни, сохранение, переписку с поддержкой
     var n = delRows_(recSheet_(), 2, a1) + delRows_(lvlSheet_(), 2, a1);
+    delRows_(saveSheet_(), 1, a1); delRows_(supSheet_(), 2, a1);
     if (u) sh.deleteRow(u.row);
     CacheService.getScriptCache().remove('on:' + a1);
     bump_();
