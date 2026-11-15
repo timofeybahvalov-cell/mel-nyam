@@ -1,1 +1,13 @@
-{"api":"https://script.google.com/macros/s/AKfycbyb8k1KfI-1nc3Rod09Cc0W3NC77h_D_49Ub2DzqWqFC0pxhxUBZf5N1A05PTmtXq0TlQ/exec"}
+{
+ "api": "https://script.google.com/macros/s/AKfycbyb8k1KfI-1nc3Rod09Cc0W3NC77h_D_49Ub2DzqWqFC0pxhxUBZf5N1A05PTmtXq0TlQ/exec",
+ "donate": "https://pay.cloudtips.ru/p/f90f0bc5",
+ "ver": 400,
+ "vname": "0.4",
+ "html": "MelNyam.html",
+ "exe": "MelNyam.exe",
+ "exe_size": 6978560,
+ "exe_sha": "b935fe466ce64218b12e01b9e12b4230052f79a62b3e333f93ccebd87372ee09",
+ "apk": "MelNyam.apk",
+ "apk_size": 6727602,
+ "apk_sha": "3803232324f665b00af1f2eeb5a590fb75c9331f90542fa726cabeefedd4097f"
+}
