@@ -11,6 +11,9 @@
  * С версии 0.4 здесь же: аккаунты игроков (ник + пароль), список «кто в сети» и команды админки.
  * С версии 0.5: прогресс игрока хранится в его аккаунте (лист «saves»), переписка с поддержкой
  * (лист «support») и значки игроков (столбец «badge» на листе «users»).
+ * С версии 0.6: «Город Мелстроев». У каждого аккаунта есть дом: номер участка, вид дома и счётчик гостей
+ * лежат на листе «users» (столбцы «plot», «look», «visits»), а обстановка дома и «Мой говорящий Мел» —
+ * на листе «saves» (столбцы «rev6», «data6»). Новые столбцы скрипт добавляет сам.
  *   • Пароли игроков в таблицу не попадают: игра присылает только их SHA-256, а на листе «users»
  *     хранится хеш от этого хеша с «солью». Узнать пароль по таблице нельзя.
  *   • Админка (MelNyamAdmin.exe) работает только с паролем админки. Его создаёт функция
@@ -23,8 +26,10 @@
  *   • чтобы заблокировать игрока, впиши любой символ в столбец «banned» на листе «users».
  */
 var SALT = 'mel-nyam/v2/4eKywka';   // тот же, что в игре (src/g_online.inc)
-var PROTO = 5;                      // что умеет этот скрипт: 2 — рекорды и уровни (V0.2, V0.3), 4 — ещё и аккаунты (V0.4), 5 — сохранения, поддержка, значки (V0.5)
+var PROTO = 6;                      // что умеет этот скрипт: 2 — рекорды и уровни (V0.2, V0.3), 4 — ещё и аккаунты (V0.4), 5 — сохранения, поддержка, значки (V0.5)
 var SAVE_MAX = 6000;                // самое длинное сохранение игрока, символов
+var HOME_MAX = 3000;                // самое длинное сохранение дома и говорящего Мела (V0.6), символов
+var CITY_PAGE = 400;                // сколько домов города отдаётся за один запрос
 var MSG_LEN = 300;                  // самое длинное сообщение в поддержку, символов
 var MSG_PER_MIN = 4;                // сообщений в поддержку от одного игрока за минуту
 var MSG_PER_6H = 40;                // ...и за шесть часов
@@ -65,6 +70,9 @@ function handleGet_(p) {
   if (a === 'mine') return mine_(String(p.u || ''), String(p.t || ''));
   if (a === 'load') return load_(String(p.u || ''), String(p.t || ''));
   if (a === 'mylv') return mylv_(String(p.u || ''), String(p.t || ''));
+  if (a === 'city') return city_(parseInt(p.o, 10) || 0);
+  if (a === 'house') return house_(parseInt(p.n, 10) || 0, String(p.u || ''));
+  if (a === 'load6') return load6_(String(p.u || ''), String(p.t || ''));
   if (a === 'chat') return chat_(String(p.u || ''), String(p.k || ''), parseInt(p.after, 10) || 0, String(p.peek || '') === '1');
   if (a === 'time') return 'ok\t' + Math.floor(Date.now() / 1000);
   if (a === 'ping' || a === '') return 'ok\tmel-nyam\t' + PROTO;
@@ -83,6 +91,7 @@ function handlePost_(body) {
   if (f[0] === 'pw') return pw_(f);
   if (f[0] === 'out') return out_(f);
   if (f[0] === 'save') return save_(f);
+  if (f[0] === 'save6') return save6_(f);
   if (f[0] === 'msg') return msg_(f);
   if (f[0] === 'adm') return adm_(f);
   return 'err\tunknown';
@@ -103,9 +112,9 @@ function sheet_(name, header, textCols) {
 function recSheet_() { return sheet_('records', ['level', 'uid', 'nick', 'stars', 'ticks', 'replay', 'date'], ['A:C', 'F:F']); }
 function lvlSheet_() { return sheet_('levels', ['id', 'uid', 'author', 'name', 'stars', 'bg', 'plays', 'date', 'hidden', 'data', 'replay'], ['B:D', 'I:K']); }
 function userSheet_() {
-  return sheet_('users', ['uid', 'nick', 'key', 'salt', 'hash', 'tokens', 'created', 'seen', 'where', 'ver', 'platform', 'banned', 'note', 'badge'], ['A:F', 'I:I', 'L:M']);
+  return sheet_('users', ['uid', 'nick', 'key', 'salt', 'hash', 'tokens', 'created', 'seen', 'where', 'ver', 'platform', 'banned', 'note', 'badge', 'plot', 'look', 'visits'], ['A:F', 'I:I', 'L:M']);
 }
-function saveSheet_() { return sheet_('saves', ['uid', 'rev', 'date', 'data'], ['A:A', 'D:D']); }
+function saveSheet_() { return sheet_('saves', ['uid', 'rev', 'date', 'data', 'rev6', 'data6'], ['A:A', 'D:D', 'F:F']); }
 function supSheet_() { return sheet_('support', ['id', 'uid', 'nick', 'who', 'text', 'date', 'seen', 'key'], ['B:E', 'G:H']); }
 function findRow_(sh, col, key) {    // номер первой строки, где в этом столбце стоит key, или 0
   var n = sh.getLastRow() - 1;
@@ -346,11 +355,12 @@ function kList_(sort, off) { return 'list:' + gen_() + ':' + sort + ':' + off; }
 
 /* ---------------------------------------------------------------- V0.4: игроки */
 function users_(sh) {
-  var v = rows_(sh, 14), U = { byUid: {}, byKey: {}, list: [] };
+  var v = rows_(sh, 17), U = { byUid: {}, byKey: {}, list: [] };
   for (var i = 0; i < v.length; i++) {
     var u = { row: i + 2, uid: String(v[i][0]), nick: String(v[i][1]), key: String(v[i][2]), salt: String(v[i][3]), hash: String(v[i][4]),
               tokens: String(v[i][5]) ? String(v[i][5]).split(',') : [], created: v[i][6], seen: v[i][7], where: String(v[i][8]),
-              ver: Number(v[i][9]) || 0, pf: Number(v[i][10]) || 0, banned: String(v[i][11]) !== '', note: String(v[i][12]), badge: Number(v[i][13]) || 0 };
+              ver: Number(v[i][9]) || 0, pf: Number(v[i][10]) || 0, banned: String(v[i][11]) !== '', note: String(v[i][12]), badge: Number(v[i][13]) || 0,
+              plot: Number(v[i][14]) || 0, look: String(v[i][15]), visits: Number(v[i][16]) || 0 };
     if (!u.uid) continue;
     U.byUid[u.uid] = u; U.list.push(u);
     if (u.hash && u.key) U.byKey[u.key] = u;
@@ -395,7 +405,9 @@ function reg_(f) {                   // reg, uid, ник, хеш пароля, �
     cache.put(day, String(made + 1), 21600);
     var salt = rnd_().substr(0, 16), token = rnd_();
     var row = [uid, nick, key, salt, sha_(salt + ':' + ph), tokHash_(token), now, now, '', parseInt(f[4], 10) || 0, '', '', ''];
-    if (u) sh.getRange(u.row, 1, 1, 13).setValues([row]); else sh.appendRow(row);
+    var plot = plots_(sh, U) + 1;                                                // V0.6: дом в Городе Мелстроев строится сразу
+    if (u) { sh.getRange(u.row, 1, 1, 13).setValues([row]); sh.getRange(u.row, 15, 1, 3).setValues([[plot, '', 0]]); }
+    else sh.appendRow(row.concat(['', plot, '', 0]));
     bump_();
     return 'ok\t' + uid + '\t' + nick + '\t' + token;
   } finally { lock.releaseLock(); }
@@ -533,6 +545,93 @@ function mylv_(uid, token) {         // уровни, которые опубл�
   var all = rows_(lvlSheet_(), 9), out = [];
   for (var i = 0; i < all.length; i++) if (String(all[i][1]) === uid) out.push([Number(all[i][0]), Number(all[i][6]) || 0, ts_(all[i][7]), String(all[i][8]) !== '' ? 1 : 0].join('\t'));
   return 'ok\t' + out.length + (out.length ? '\n' + out.join('\n') : '');
+}
+
+/* ---------------------------------------------------------------- V0.6: Город Мелстроев */
+/* У каждого аккаунта есть дом. Его участок — число в столбце «plot»: оно выдаётся один раз и больше не меняется,
+   поэтому дома не переезжают, даже если кого-то удалили. Вид дома на карте («look») и всё, что внутри («data6»),
+   присылает игра хозяина. Скрипт эти строки не разбирает. По номеру участка нельзя узнать номер игрока. */
+function plots_(sh, U) {             // раздать участки аккаунтам, у которых их ещё нет (по порядку строк); возвращает самый большой номер участка
+  var max = 0, need = 0, i;
+  for (i = 0; i < U.list.length; i++) { if (U.list[i].plot > max) max = U.list[i].plot; if (U.list[i].hash && !U.list[i].plot) need++; }
+  if (String(sh.getRange(1, 15).getValue()) !== 'plot') sh.getRange(1, 15, 1, 3).setValues([['plot', 'look', 'visits']]);      // таблица от прошлой версии: подписать новые столбцы
+  if (!need) return max;
+  var n = sh.getLastRow() - 1, col = sh.getRange(2, 15, n, 1).getValues();
+  for (i = 0; i < U.list.length; i++) {
+    var u = U.list[i];
+    if (u.hash && !u.plot && u.row - 2 < n) { u.plot = ++max; col[u.row - 2][0] = max; }
+  }
+  sh.getRange(2, 15, n, 1).setValues(col);
+  return max;
+}
+function withPlots_(sh) {            // список игроков, в котором у каждого аккаунта уже есть участок
+  var U = users_(sh), need = false;
+  for (var i = 0; i < U.list.length && !need; i++) need = !!U.list[i].hash && !U.list[i].plot;
+  if (!need) return U;
+  var lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try { U = users_(sh); plots_(sh, U); bump_(); } finally { lock.releaseLock(); }
+  return U;
+}
+function city_(off) {                // a=city&o=N: дома по порядку участков, по CITY_PAGE за раз: участок, ник, вид дома, значок
+  if (off < 0) off = 0;
+  var cache = CacheService.getScriptCache(), key = 'city:' + gen_() + ':' + off, hit = cache.get(key);
+  if (hit) return hit;
+  var U = withPlots_(userSheet_()), list = [], max = 0, out = [];
+  for (var i = 0; i < U.list.length; i++) {
+    var u = U.list[i];
+    if (u.plot > max) max = u.plot;
+    if (u.hash && u.plot && !u.banned) list.push(u);
+  }
+  list.sort(function (a, b) { return a.plot - b.plot; });
+  for (var k = off; k < list.length && k < off + CITY_PAGE; k++) out.push([list[k].plot, cleanNick_(list[k].nick), /^\d{1,6}$/.test(list[k].look) ? list[k].look : '0', badge_(U, list[k].uid)].join('\t'));
+  var res = 'ok\t' + list.length + '\t' + max + '\t' + out.length + (out.length ? '\n' + out.join('\n') : '');
+  cache.put(key, res, 60);
+  return res;
+}
+function house_(n, vis) {            // a=house&n=участок&u=кто пришёл: ник хозяина, значок, сколько было гостей, что в доме
+  if (n < 1) return 'err\tformat';
+  var U = usersSafe_(), u = null;
+  for (var i = 0; i < U.list.length; i++) if (U.list[i].plot === n && U.list[i].hash) { u = U.list[i]; break; }
+  if (!u || u.banned) return 'err\tnone';
+  var sh = saveSheet_(), row = findRow_(sh, 1, u.uid), data = row ? String(sh.getRange(row, 6).getValue()) : '', visits = u.visits;
+  if (/^[1-9]\d{0,9}$/.test(vis) && vis !== u.uid) {                                  // гость считается не чаще раза в час
+    var cache = CacheService.getScriptCache(), k = 'vis:' + vis + ':' + n;
+    if (!cache.get(k)) {
+      cache.put(k, '1', 3600); visits++;
+      try { var us = userSheet_(); if (String(us.getRange(u.row, 1).getValue()) === u.uid) us.getRange(u.row, 17).setValue(visits); } catch (e) {}
+    }
+  }
+  return 'ok\t' + n + '\t' + cleanNick_(u.nick) + '\t' + badge_(U, u.uid) + '\t' + visits + '\t' + data;
+}
+function load6_(uid, token) {        // свой дом: номер сохранения, участок, сколько было гостей, данные
+  var us = userSheet_(), U = withPlots_(us), u = auth_(U, uid, token);
+  if (!u) return isBanned_(U, uid) ? 'err\tban' : 'err\tauth';
+  var sh = saveSheet_(), row = findRow_(sh, 1, uid);
+  if (!row) return 'ok\t0\t' + u.plot + '\t' + u.visits + '\t';
+  var v = sh.getRange(row, 1, 1, 6).getValues()[0];
+  return 'ok\t' + (Number(v[4]) || 0) + '\t' + u.plot + '\t' + u.visits + '\t' + String(v[5]);
+}
+function save6_(f) {                 // save6, uid, ключ, номер сохранения, которое игра видела, вид дома на карте, данные, подпись
+  if (f.length < 7) return 'err\tformat';
+  var uid = f[1], base = parseInt(f[3], 10) || 0, look = f[4], data = f[5];
+  if (!/^\d{1,10}$/.test(uid) || !/^\d{1,6}$/.test(look) || data.length > HOME_MAX || !/^v6\|[0-9a-z.,:|\-]*$/.test(data)) return 'err\tformat';
+  if (sig_(['save6', uid, f[3], look, data]) !== f[6]) return 'err\tsig';
+  var lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    var us = userSheet_(), U = users_(us), u = auth_(U, uid, f[2]);
+    if (!u) return isBanned_(U, uid) ? 'err\tban' : 'err\tauth';
+    var sh = saveSheet_(), row = findRow_(sh, 1, uid), now = new Date();
+    if (!row) { sh.appendRow([uid, 0, now, '', 1, data]); }
+    else {
+      var v = sh.getRange(row, 1, 1, 6).getValues()[0], rev = Number(v[4]) || 0;
+      if (rev !== base) return 'err\tconflict\t' + rev + '\t' + String(v[5]);
+      sh.getRange(row, 5, 1, 2).setValues([[rev + 1, data]]);
+    }
+    if (u.look !== look) us.getRange(u.row, 16).setValue(look);                       // дом на карте города выглядит по-новому (карта обновится в течение минуты)
+    return 'ok\t' + (row ? rev + 1 : 1);
+  } finally { lock.releaseLock(); }
 }
 
 /* ---------------------------------------------------------------- V0.5: поддержка */
@@ -699,16 +798,17 @@ function admRun_(cmd, a1, a2, props) {
   if (cmd === 'users') {             // все, кого знает таблица: и с аккаунтом, и без (по рекордам и уровням)
     var rs = recSheet_(), recs = rows_(rs, 3), lv = rows_(lvlSheet_(), 8), m = {}, order = [], e;
     var rd = recs.length ? rs.getRange(2, 7, recs.length, 1).getValues() : [];             // когда поставлен каждый рекорд
-    var get = function (uid) { if (!m[uid]) { m[uid] = { uid: uid, nick: '', reg: 0, ban: 0, created: 0, seen: 0, where: '', ver: 0, pf: 0, recs: 0, lvls: 0, note: '', badge: 0 }; order.push(uid); } return m[uid]; };
+    var get = function (uid) { if (!m[uid]) { m[uid] = { uid: uid, nick: '', reg: 0, ban: 0, created: 0, seen: 0, where: '', ver: 0, pf: 0, recs: 0, lvls: 0, note: '', badge: 0, plot: 0, look: '0', visits: 0 }; order.push(uid); } return m[uid]; };
     for (i = 0; i < U.list.length; i++) {
       var x = U.list[i]; e = get(x.uid);
       e.nick = x.nick; e.reg = x.hash ? 1 : 0; e.ban = x.banned ? 1 : 0; e.created = ts_(x.created); e.seen = ts_(x.seen); e.where = x.where; e.ver = x.ver; e.pf = x.pf; e.note = x.note; e.badge = badge_(U, x.uid);
+      e.plot = x.hash ? x.plot : 0; e.look = /^\d{1,6}$/.test(x.look) ? x.look : '0'; e.visits = x.visits;      // V0.6: дом в городе
     }
     // «был в игре»: последний отклик игры, а у тех, кто играл до V0.4, — день последнего рекорда или уровня
     for (i = 0; i < recs.length; i++) { e = get(String(recs[i][1])); e.recs++; if (!e.nick) e.nick = String(recs[i][2]); e.seen = Math.max(e.seen, ts_(rd[i][0])); }
     for (i = 0; i < lv.length; i++) { e = get(String(lv[i][1])); e.lvls++; if (!e.nick) e.nick = String(lv[i][2]); e.seen = Math.max(e.seen, ts_(lv[i][7])); }
     out = ['ok\t' + order.length];
-    for (i = 0; i < order.length; i++) { e = m[order[i]]; out.push([e.uid, e.nick, e.reg, e.ban, e.created, e.seen, e.where, e.ver, e.pf, e.recs, e.lvls, String(e.note).replace(/[\t\n\r]/g, ' '), e.badge].join('\t')); }
+    for (i = 0; i < order.length; i++) { e = m[order[i]]; out.push([e.uid, e.nick, e.reg, e.ban, e.created, e.seen, e.where, e.ver, e.pf, e.recs, e.lvls, String(e.note).replace(/[\t\n\r]/g, ' '), e.badge, e.plot, e.look, e.visits].join('\t')); }
     return out.join('\n');
   }
   if (cmd === 'levels') {
@@ -748,6 +848,14 @@ function admRun_(cmd, a1, a2, props) {
     CacheService.getScriptCache().remove('on:' + a1);
     bump_();
     return 'ok\t' + n + '\t' + (u ? 1 : 0);
+  }
+  if (cmd === 'delhome') {           // V0.6: очистить дом игрока (обстановку и говорящего Мела); участок остаётся за ним
+    if (!u || !u.hash) return 'err\tnone';
+    var hs = saveSheet_(), hr = findRow_(hs, 1, a1);
+    if (hr) hs.getRange(hr, 5, 1, 2).setValues([[(Number(hs.getRange(hr, 5).getValue()) || 0) + 1, '']]);
+    sh.getRange(u.row, 16).setValue('');
+    bump_();
+    return 'ok\t' + (hr ? 1 : 0);
   }
   if (cmd === 'resetpw') {           // новый пароль игроку (a2 — SHA-256 пароля, как его прислала бы игра); со всех устройств он выходит
     if (!u || !u.hash) return 'err\tnot found';
